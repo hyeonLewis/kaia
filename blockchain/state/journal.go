@@ -24,6 +24,7 @@ package state
 
 import (
 	"math/big"
+	"sync"
 
 	"github.com/kaiachain/kaia/common"
 )
@@ -42,6 +43,8 @@ type journalEntry interface {
 // commit. These are tracked to be able to be reverted in case of an execution
 // exception or revertal request.
 type journal struct {
+	mtx sync.RWMutex
+
 	entries []journalEntry         // Current changes tracked by the journal
 	dirties map[common.Address]int // Dirty accounts and the number of changes
 }
@@ -55,6 +58,9 @@ func newJournal() *journal {
 
 // append inserts a new modification entry to the end of the change journal.
 func (j *journal) append(entry journalEntry) {
+	j.mtx.Lock()
+	defer j.mtx.Unlock()
+
 	j.entries = append(j.entries, entry)
 	if addr := entry.dirtied(); addr != nil {
 		j.dirties[*addr]++
@@ -64,6 +70,9 @@ func (j *journal) append(entry journalEntry) {
 // revert undoes a batch of journalled modifications along with any reverted
 // dirty handling too.
 func (j *journal) revert(statedb *StateDB, snapshot int) {
+	j.mtx.RLock()
+	defer j.mtx.RUnlock()
+
 	for i := len(j.entries) - 1; i >= snapshot; i-- {
 		// Undo the changes made by the operation
 		j.entries[i].revert(statedb)
@@ -82,11 +91,17 @@ func (j *journal) revert(statedb *StateDB, snapshot int) {
 // otherwise suggest it as clean. This method is an ugly hack to handle the RIPEMD
 // precompile consensus exception.
 func (j *journal) dirty(addr common.Address) {
+	j.mtx.Lock()
+	defer j.mtx.Unlock()
+
 	j.dirties[addr]++
 }
 
 // length returns the current number of entries in the journal.
 func (j *journal) length() int {
+	j.mtx.RLock()
+	defer j.mtx.RUnlock()
+
 	return len(j.entries)
 }
 
@@ -154,8 +169,8 @@ type (
 )
 
 func (ch createObjectChange) revert(s *StateDB) {
-	delete(s.stateObjects, *ch.account)
-	delete(s.stateObjectsDirty, *ch.account)
+	s.stateObjects.Delete(*ch.account)
+	s.stateObjectsDirty.Delete(*ch.account)
 }
 
 func (ch createObjectChange) dirtied() *common.Address {

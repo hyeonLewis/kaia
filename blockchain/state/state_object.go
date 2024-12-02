@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -91,6 +92,7 @@ type stateObject struct {
 	storageTrie Trie // storage trie, which becomes non-nil on first access
 	code        Code // contract bytecode, which gets set when code is loaded
 
+	mtx           sync.RWMutex
 	originStorage Storage // Storage cache of original entries to dedup rewrites
 	dirtyStorage  Storage // Storage entries that need to be flushed to disk
 	fakeStorage   Storage // Fake storage which constructed by caller for debugging purpose.
@@ -192,7 +194,9 @@ func (s *stateObject) getStorageTrie(db Database) Trie {
 // GetState retrieves a value from the account storage trie.
 func (s *stateObject) GetState(db Database, key common.Hash) common.Hash {
 	// If we have a dirty value for this state entry, return it
+	s.mtx.RLock()
 	value, dirty := s.dirtyStorage[key]
+	s.mtx.RUnlock()
 	if dirty {
 		return value
 	}
@@ -203,7 +207,9 @@ func (s *stateObject) GetState(db Database, key common.Hash) common.Hash {
 // GetCommittedState retrieves a value from the committed account storage trie.
 func (s *stateObject) GetCommittedState(db Database, key common.Hash) common.Hash {
 	// If we have the original value cached, return that
+	s.mtx.RLock()
 	value, cached := s.originStorage[key]
+	s.mtx.RUnlock()
 	if cached {
 		return value
 	}
@@ -263,7 +269,9 @@ func (s *stateObject) GetCommittedState(db Database, key common.Hash) common.Has
 		}
 		value.SetBytes(content)
 	}
+	s.mtx.Lock()
 	s.originStorage[key] = value
+	s.mtx.Unlock()
 	return value
 }
 
@@ -332,6 +340,9 @@ func (s *stateObject) GetKey() accountkey.AccountKey {
 }
 
 func (s *stateObject) setState(key, value common.Hash) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
 	s.dirtyStorage[key] = value
 }
 
@@ -341,6 +352,9 @@ func (s *stateObject) UpdateKey(newKey accountkey.AccountKey, currentBlockNumber
 
 // updateStorageTrie writes cached storage modifications into the object's storage trie.
 func (s *stateObject) updateStorageTrie(db Database) Trie {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
 	// Track the amount of time wasted on updating the storage trie
 	if EnabledExpensive {
 		defer func(start time.Time) { s.db.StorageUpdates += time.Since(start) }(time.Now())
@@ -357,7 +371,6 @@ func (s *stateObject) updateStorageTrie(db Database) Trie {
 			continue
 		}
 		s.originStorage[key] = value
-
 		var v []byte
 		if (value == common.Hash{}) {
 			s.setError(tr.TryDelete(key[:]))
@@ -394,7 +407,7 @@ func (s *stateObject) updateStorageRoot(db Database) {
 
 // setStorageRoot calls SetStorageRoot if updateStorageRoot flag is given true.
 // Otherwise, it just marks the object and update their root hash later.
-func (s *stateObject) setStorageRoot(updateStorageRoot bool, objectsToUpdate map[common.Address]struct{}) {
+func (s *stateObject) setStorageRoot(updateStorageRoot bool, objectsToUpdate *sync.Map) {
 	if acc := account.GetProgramAccount(s.account); acc != nil {
 		if updateStorageRoot {
 			// Track the amount of time wasted on hashing the storage trie
@@ -405,7 +418,7 @@ func (s *stateObject) setStorageRoot(updateStorageRoot bool, objectsToUpdate map
 			return
 		}
 		// If updateStorageRoot == false, it just marks the object and updates its storage root later.
-		objectsToUpdate[s.Address()] = struct{}{}
+		objectsToUpdate.Store(s.Address(), struct{}{})
 	}
 }
 
@@ -470,6 +483,9 @@ func (s *stateObject) setBalance(amount *big.Int) {
 func (s *stateObject) ReturnGas(gas *big.Int) {}
 
 func (s *stateObject) deepCopy(db *StateDB) *stateObject {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
 	stateObject := newObject(db, s.address, s.account.DeepCopy())
 	if s.storageTrie != nil {
 		stateObject.storageTrie = db.db.CopyTrie(s.storageTrie)

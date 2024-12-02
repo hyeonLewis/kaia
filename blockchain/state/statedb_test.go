@@ -208,7 +208,13 @@ func TestStateObjects(t *testing.T) {
 		stateDB.updateStateObject(stateObj)
 	}
 
-	assert.Equal(t, 128, len(stateDB.stateObjects))
+	len := 0
+	stateDB.stateObjects.Range(func(addr, _ interface{}) bool {
+		len++
+		return true
+	})
+
+	assert.Equal(t, 128, len)
 }
 
 // Test that invalid pruning options are prohibited.

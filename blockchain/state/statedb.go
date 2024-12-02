@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -73,9 +74,10 @@ type StateDB struct {
 	snapStorage   map[common.Hash]map[common.Hash][]byte
 
 	// This map holds 'live' objects, which will get modified while processing a state transition.
-	stateObjects             map[common.Address]*stateObject
-	stateObjectsDirty        map[common.Address]struct{}
-	stateObjectsDirtyStorage map[common.Address]struct{}
+	// Using sync.Map performs better than mutex since we have more read operations than write operations.
+	stateObjects             *sync.Map
+	stateObjectsDirty        *sync.Map
+	stateObjectsDirtyStorage *sync.Map
 
 	// DB error.
 	// State objects are used by the consensus core and VM which are
@@ -133,9 +135,9 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree, opts *statedb.Trie
 		trie:                     tr,
 		trieOpts:                 opts,
 		snaps:                    snaps,
-		stateObjects:             make(map[common.Address]*stateObject),
-		stateObjectsDirtyStorage: make(map[common.Address]struct{}),
-		stateObjectsDirty:        make(map[common.Address]struct{}),
+		stateObjects:             &sync.Map{},
+		stateObjectsDirtyStorage: &sync.Map{},
+		stateObjectsDirty:        &sync.Map{},
 		logs:                     make(map[common.Hash][]*types.Log),
 		preimages:                make(map[common.Hash][]byte),
 		accessList:               newAccessList(),
@@ -184,8 +186,9 @@ func (s *StateDB) Reset(root common.Hash) error {
 		return err
 	}
 	s.trie = tr
-	s.stateObjects = make(map[common.Address]*stateObject)
-	s.stateObjectsDirty = make(map[common.Address]struct{})
+	s.stateObjects = &sync.Map{}
+	s.stateObjectsDirty = &sync.Map{}
+	s.stateObjectsDirtyStorage = &sync.Map{}
 	s.thash = common.Hash{}
 	s.bhash = common.Hash{}
 	s.txIndex = 0
@@ -624,8 +627,8 @@ func (s *StateDB) getStateObject(addr common.Address) *stateObject {
 // destructed object instead of wiping all knowledge about the state object.
 func (s *StateDB) getDeletedStateObject(addr common.Address) *stateObject {
 	// First, check stateObjects if there is "live" object.
-	if obj := s.stateObjects[addr]; obj != nil {
-		return obj
+	if obj, ok := s.stateObjects.Load(addr); ok {
+		return obj.(*stateObject)
 	}
 	// If no live objects are available, attempt to use snapshots
 	var (
@@ -670,7 +673,7 @@ func (s *StateDB) getDeletedStateObject(addr common.Address) *stateObject {
 }
 
 func (s *StateDB) setStateObject(object *stateObject) {
-	s.stateObjects[object.Address()] = object
+	s.stateObjects.Store(object.Address(), object)
 }
 
 // Retrieve a state object or create a new state object if nil.
@@ -834,9 +837,9 @@ func (s *StateDB) Copy() *StateDB {
 	state := &StateDB{
 		db:                       s.db,
 		trie:                     s.db.CopyTrie(s.trie),
-		stateObjects:             make(map[common.Address]*stateObject, len(s.journal.dirties)),
-		stateObjectsDirty:        make(map[common.Address]struct{}, len(s.journal.dirties)),
-		stateObjectsDirtyStorage: make(map[common.Address]struct{}),
+		stateObjects:             &sync.Map{},
+		stateObjectsDirty:        &sync.Map{},
+		stateObjectsDirtyStorage: &sync.Map{},
 		refund:                   s.refund,
 		logs:                     make(map[common.Hash][]*types.Log, len(s.logs)),
 		logSize:                  s.logSize,
@@ -849,20 +852,22 @@ func (s *StateDB) Copy() *StateDB {
 		// and in the Finalise-method, there is a case where an object is in the journal but not
 		// in the stateObjects: OOG after touch on ripeMD prior to Byzantium. Thus, we need to check for
 		// nil
-		if object, exist := s.stateObjects[addr]; exist {
-			state.stateObjects[addr] = object.deepCopy(state)
-			state.stateObjectsDirty[addr] = struct{}{}
+		if object, exist := s.stateObjects.Load(addr); exist {
+			state.stateObjects.Store(addr, object.(*stateObject).deepCopy(state))
+			state.stateObjectsDirty.Store(addr, struct{}{})
 		}
 	}
 	// Above, we don't copy the actual journal. This means that if the copy is copied, the
 	// loop above will be a no-op, since the copy's journal is empty.
 	// Thus, here we iterate over stateObjects, to enable copies of copies
-	for addr := range s.stateObjectsDirty {
-		if _, exist := state.stateObjects[addr]; !exist {
-			state.stateObjects[addr] = s.stateObjects[addr].deepCopy(state)
-			state.stateObjectsDirty[addr] = struct{}{}
+	s.stateObjectsDirty.Range(func(addr, _ interface{}) bool {
+		if _, exist := state.stateObjects.Load(addr); !exist {
+			object, _ := s.stateObjects.Load(addr)
+			state.stateObjects.Store(addr, object.(*stateObject).deepCopy(state))
+			state.stateObjectsDirty.Store(addr, struct{}{})
 		}
-	}
+		return true
+	})
 
 	deepCopyLogs(s, state)
 
@@ -950,7 +955,7 @@ func (s *StateDB) GetRefund() uint64 {
 // and clears the journal as well as the refunds.
 func (stateDB *StateDB) Finalise(deleteEmptyObjects bool, setStorageRoot bool) {
 	for addr := range stateDB.journal.dirties {
-		so, exist := stateDB.stateObjects[addr]
+		val, exist := stateDB.stateObjects.Load(addr)
 		if !exist {
 			// ripeMD is 'touched' at block 1714175, in tx 0x1237f737031e40bcde4a8b7e717b2d15e3ecadfe49bb1bbc71ee9deb09c6fcf2
 			// That tx goes out of gas, and although the notion of 'touched' does not exist there, the
@@ -960,7 +965,7 @@ func (stateDB *StateDB) Finalise(deleteEmptyObjects bool, setStorageRoot bool) {
 			// Thus, we can safely ignore it here
 			continue
 		}
-
+		so := val.(*stateObject)
 		if so.selfDestructed || (deleteEmptyObjects && so.empty()) {
 			stateDB.deleteStateObject(so)
 
@@ -979,20 +984,21 @@ func (stateDB *StateDB) Finalise(deleteEmptyObjects bool, setStorageRoot bool) {
 			stateDB.updateStateObject(so)
 		}
 		so.created = false
-		stateDB.stateObjectsDirty[addr] = struct{}{}
+		stateDB.stateObjectsDirty.Store(addr, struct{}{})
 	}
 	// Invalidate journal because reverting across transactions is not allowed.
 	stateDB.clearJournalAndRefund()
 
-	if setStorageRoot && len(stateDB.stateObjectsDirtyStorage) > 0 {
-		for addr := range stateDB.stateObjectsDirtyStorage {
-			so, exist := stateDB.stateObjects[addr]
+	if setStorageRoot {
+		stateDB.stateObjectsDirtyStorage.Range(func(addr, _ interface{}) bool {
+			val, exist := stateDB.stateObjects.Load(addr)
 			if exist {
-				so.updateStorageRoot(stateDB.db)
-				stateDB.updateStateObject(so)
+				val.(*stateObject).updateStorageRoot(stateDB.db)
+				stateDB.updateStateObject(val.(*stateObject))
 			}
-		}
-		stateDB.stateObjectsDirtyStorage = make(map[common.Address]struct{})
+			return true
+		})
+		stateDB.stateObjectsDirtyStorage = &sync.Map{}
 	}
 }
 
@@ -1031,14 +1037,21 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (root common.Hash, err error) 
 	defer s.clearJournalAndRefund()
 
 	for addr := range s.journal.dirties {
-		s.stateObjectsDirty[addr] = struct{}{}
+		s.stateObjectsDirty.Store(addr, struct{}{})
 	}
 
-	objectEncoder := getStateObjectEncoder(len(s.stateObjects))
+	len := 0
+	s.stateObjectsDirty.Range(func(addr, _ interface{}) bool {
+		len++
+		return true
+	})
+	objectEncoder := getStateObjectEncoder(len)
 	var stateObjectsToUpdate []*stateObject
+	var commitError error
 	// Commit objects to the trie.
-	for addr, stateObject := range s.stateObjects {
-		_, isDirty := s.stateObjectsDirty[addr]
+	s.stateObjects.Range(func(addr, so interface{}) bool {
+		_, isDirty := s.stateObjectsDirty.Load(addr)
+		stateObject := so.(*stateObject)
 		switch {
 		case stateObject.selfDestructed || (isDirty && deleteEmptyObjects && stateObject.empty()):
 			// If the object has been removed, don't bother syncing it
@@ -1053,14 +1066,20 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (root common.Hash, err error) 
 				}
 				// Write any storage changes in the state object to its storage trie.
 				if err := stateObject.CommitStorageTrie(s.db); err != nil {
-					return common.Hash{}, err
+					commitError = err
+					return false
 				}
 			}
 			// Update the object in the main account trie.
 			stateObjectsToUpdate = append(stateObjectsToUpdate, stateObject)
 			objectEncoder.encode(stateObject)
 		}
-		delete(s.stateObjectsDirty, addr)
+		s.stateObjectsDirty.Delete(addr)
+		return true
+	})
+
+	if commitError != nil {
+		return common.Hash{}, commitError
 	}
 
 	for _, so := range stateObjectsToUpdate {
