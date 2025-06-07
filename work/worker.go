@@ -884,12 +884,8 @@ func (env *Task) commitTransaction(tx *types.Transaction, bc BlockChain, rewardb
 }
 
 func (env *Task) commitBundleTransaction(bundle *builder.Bundle, bc BlockChain, rewardbase common.Address, vmConfig *vm.Config) (error, *types.Transaction, []*types.Log) {
-	lastSnapshot := env.state.Copy()
-	gasUsedSnapshot := env.header.GasUsed
-	tcountSnapshot := env.tcount
-	txs := []*types.Transaction{}
-	receipts := []*types.Receipt{}
-	logs := []*types.Log{}
+	txs := make([]*types.Transaction, len(bundle.BundleTxs))
+	logs := make([]*types.Log, 0)
 
 	markAllTxUnexecutable := func() {
 		for _, txOrGen := range bundle.BundleTxs {
@@ -900,45 +896,36 @@ func (env *Task) commitBundleTransaction(bundle *builder.Bundle, bc BlockChain, 
 		}
 	}
 
-	restoreEnv := func() {
-		env.state.Set(lastSnapshot)
-		env.header.GasUsed = gasUsedSnapshot
-		env.tcount = tcountSnapshot
-	}
-
-	for _, txOrGen := range bundle.BundleTxs {
-		tx, err := txOrGen.GetTx(env.state.GetNonce(rewardbase))
+	initialNonce := env.state.GetNonce(rewardbase)
+	for i, txOrGen := range bundle.BundleTxs {
+		tx, err := txOrGen.GetTx(initialNonce)
 		if err != nil {
 			logger.Error("TxGenerator error", "error", err)
 			markAllTxUnexecutable()
-			restoreEnv()
 			return kerrors.ErrTxGeneration, nil, nil
 		}
-
-		env.state.SetTxContext(tx.Hash(), common.Hash{}, env.tcount)
-		receipt, _, err := bc.ApplyTransaction(env.config, &rewardbase, env.state, env.header, tx, &env.header.GasUsed, vmConfig)
-		// Bundled tx will be rejected with any receipt.Status other than success.
-		// There may be cases where a revert occurs within the EVM, which could result in an attack on a tx sender in an already executed bundle.
-		if err != nil || receipt.Status != types.ReceiptStatusSuccessful {
-			if err != vm.ErrInsufficientBalance && err != vm.ErrTotalTimeLimitReached {
-				markAllTxUnexecutable()
-			}
-			logger.Error("ApplyTransaction error, restoring env", "error", err)
-			restoreEnv()
-			if err == nil {
-				err = kerrors.ErrRevertedBundleByVmErr
-			}
-			return err, tx, nil
+		if addr, _ := types.Sender(env.signer, tx); addr == rewardbase {
+			initialNonce++
 		}
-
-		env.tcount++
-		txs = append(txs, tx)
-		receipts = append(receipts, receipt)
-		logs = append(logs, receipt.Logs...)
+		txs[i] = tx
 	}
 
+	receipts, tcount, usedGas, err := bc.ApplyBundleTransactions(env.config, &rewardbase, env.state, env.header, txs, vmConfig, env.tcount)
+	if err != nil {
+		logger.Error("ApplyBundleTransactions error", "error", err)
+		if err != vm.ErrInsufficientBalance && err != vm.ErrTotalTimeLimitReached {
+			markAllTxUnexecutable()
+		}
+		return err, txs[tcount], nil
+	}
+
+	env.header.GasUsed += usedGas
+	env.tcount += tcount
 	env.txs = append(env.txs, txs...)
 	env.receipts = append(env.receipts, receipts...)
+	for _, receipt := range receipts {
+		logs = append(logs, receipt.Logs...)
+	}
 
 	return nil, nil, logs
 }

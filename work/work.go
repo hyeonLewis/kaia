@@ -310,6 +310,7 @@ type BlockChain interface {
 	WriteBlockWithState(block *types.Block, receipts []*types.Receipt, stateDB *state.StateDB) (blockchain.WriteResult, error)
 	PostChainEvents(events []interface{}, logs []*types.Log)
 	ApplyTransaction(config *params.ChainConfig, author *common.Address, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg *vm.Config) (*types.Receipt, *vm.InternalTxTrace, error)
+	ApplyBundleTransactions(config *params.ChainConfig, author *common.Address, statedb *state.StateDB, header *types.Header, txs []*types.Transaction, cfg *vm.Config, tcount int) ([]*types.Receipt, int, uint64, error)
 
 	// State Migration
 	PrepareStateMigration() error

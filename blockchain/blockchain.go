@@ -49,6 +49,7 @@ import (
 	"github.com/kaiachain/kaia/event"
 	"github.com/kaiachain/kaia/fork"
 	"github.com/kaiachain/kaia/kaiax"
+	"github.com/kaiachain/kaia/kerrors"
 	"github.com/kaiachain/kaia/log"
 	kaiametrics "github.com/kaiachain/kaia/metrics"
 	"github.com/kaiachain/kaia/params"
@@ -2733,6 +2734,60 @@ func (bc *BlockChain) SaveTrieNodeCacheToDisk() error {
 	}
 	go bc.stateCache.TrieDB().SaveTrieNodeCacheToFile(bc.cacheConfig.TrieNodeCacheConfig.FastCacheFileDir, runtime.NumCPU()/2)
 	return nil
+}
+
+func (bc *BlockChain) ApplyBundleTransactions(chainConfig *params.ChainConfig, author *common.Address, statedb *state.StateDB, header *types.Header, txs []*types.Transaction, vmConfig *vm.Config, tcount int) ([]*types.Receipt, int, uint64, error) {
+	snapshot := statedb.Snapshot()
+	receipts := make([]*types.Receipt, 0)
+	usedGas := uint64(0)
+
+	blockNumber := header.Number.Uint64()
+
+	for i, tx := range txs {
+		statedb.SetTxContext(tx.Hash(), common.Hash{}, tcount+i)
+
+		// validation for each transaction before execution
+		if err := tx.Validate(statedb, blockNumber); err != nil {
+			statedb.RevertToSnapshot(snapshot)
+			return nil, i, 0, err
+		}
+
+		msg, err := tx.AsMessageWithAccountKeyPicker(types.MakeSigner(chainConfig, header.Number), statedb, blockNumber)
+		if err != nil {
+			statedb.RevertToSnapshot(snapshot)
+			return nil, i, 0, err
+		}
+		// Create a new context to be used in the EVM environment
+		blockContext := NewEVMBlockContext(header, bc, author)
+		txContext := NewEVMTxContext(msg, header, chainConfig)
+		// Create a new environment which holds all relevant information
+		// about the transaction and calling mechanisms.
+		vmenv := vm.NewEVM(blockContext, txContext, statedb, chainConfig, vmConfig)
+
+		// Apply the transaction to the current state (included in the env)
+		result, err := ApplyMessage(vmenv, msg)
+		if err != nil || result.VmExecutionStatus != types.ReceiptStatusSuccessful {
+			if err == nil {
+				err = kerrors.ErrRevertedBundleByVmErr
+			}
+			statedb.RevertToSnapshot(snapshot)
+			return nil, i, 0, err
+		}
+
+		usedGas += result.UsedGas
+		receipt := types.NewReceipt(result.VmExecutionStatus, tx.Hash(), result.UsedGas)
+		// if the transaction created a contract, store the creation address in the receipt.
+		msg.FillContractAddress(vmenv.Origin, receipt)
+		// Set the receipt logs and create a bloom for filtering
+		receipt.Logs = statedb.GetLogs(tx.Hash())
+		receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
+
+		receipts = append(receipts, receipt)
+	}
+
+	statedb.Finalise(true, false)
+
+	return receipts, len(txs) - 1, usedGas, nil
 }
 
 // ApplyTransaction attempts to apply a transaction to the given state database
