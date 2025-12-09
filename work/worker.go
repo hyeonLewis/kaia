@@ -563,7 +563,9 @@ func (self *worker) commitNewWork() {
 	var nextBaseFee *big.Int
 	if self.nodetype == common.CONSENSUSNODE {
 		// Check any fork transitions needed
+		start := time.Now()
 		pending, err = self.backend.TxPool().Pending()
+		logger.Info("[Test] TxPool.Pending", "elapsed", common.PrettyDuration(time.Since(start)), "users", len(pending))
 		if err != nil {
 			logger.Error("Failed to fetch pending transactions", "err", err)
 			return
@@ -572,13 +574,17 @@ func (self *worker) commitNewWork() {
 		if self.config.IsMagmaForkEnabled(nextBlockNum) {
 			// NOTE-Kaia NextBlockBaseFee needs the header of parent, self.chain.CurrentBlock
 			// So above code, TxPool().Pending(), is separated with this and can be refactored later.
+			start = time.Now()
 			pset := self.govModule.GetParamSet(nextBlockNum.Uint64())
 			nextBaseFee = misc.NextMagmaBlockBaseFee(parent.Header(), pset.ToKip71Config())
 			pending = types.FilterTransactionWithBaseFee(pending, nextBaseFee)
+			logger.Info("[Test] FilterTransactionWithBaseFee", "elapsed", common.PrettyDuration(time.Since(start)))
 		}
 
 		// Filter txs with txBundlingModules
+		start = time.Now()
 		builder.FilterTxs(pending, self.txBundlingModules)
+		logger.Info("[Test] FilterTxs", "elapsed", time.Since(start))
 	}
 
 	header := &types.Header{
@@ -614,7 +620,9 @@ func (self *worker) commitNewWork() {
 		minerBalanceGauge.Update(getBalanceForGauge(work.state, self.nodeAddr))
 
 		// Sort txs then execute them
+		start := time.Now()
 		txs := types.NewTransactionsByPriceAndNonce(self.current.signer, pending, work.header.BaseFee)
+		logger.Info("[Test] NewTransactionsByPriceAndNonce", "elapsed", common.PrettyDuration(time.Since(start)))
 		work.commitTransactions(self.mux, txs, self.chain, self.nodeAddr, self.txBundlingModules)
 		finishedCommitTx := time.Now()
 
