@@ -60,6 +60,7 @@ import (
 	"github.com/kaiachain/kaia/storage/database"
 	"github.com/kaiachain/kaia/storage/statedb"
 	"github.com/rcrowley/go-metrics"
+	"golang.org/x/sync/errgroup"
 )
 
 // If total insertion time of a block exceeds insertTimeLimit,
@@ -2265,10 +2266,13 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 		stats.report(chain, i, cache)
 
 		// Invoke ExecutionModules after inserting a block.
+		// Modules are mutually independent; run concurrently to reduce hot-path latency.
+		var eg errgroup.Group
 		for _, module := range bc.executionModules {
-			if err := module.PostInsertBlock(block); err != nil {
-				return i, events, coalescedLogs, err
-			}
+			eg.Go(func() error { return module.PostInsertBlock(block) })
+		}
+		if err := eg.Wait(); err != nil {
+			return i, events, coalescedLogs, err
 		}
 	}
 	// Append a single chain head event if we've progressed the chain
