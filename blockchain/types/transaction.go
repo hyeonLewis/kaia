@@ -414,6 +414,23 @@ func (tx *Transaction) WithoutBlobTxSidecar() *Transaction {
 	return cpy
 }
 
+// CachedFrom returns the opaque sender cache for sender transplant between tx twins.
+func (tx *Transaction) CachedFrom() any { return tx.from.Load() }
+
+func (tx *Transaction) StoreFromCache(v any) {
+	if v != nil {
+		tx.from.Store(v)
+	}
+}
+
+func (tx *Transaction) CachedFeePayer() any { return tx.feePayer.Load() }
+
+func (tx *Transaction) StoreFeePayerCache(v any) {
+	if v != nil {
+		tx.feePayer.Store(v)
+	}
+}
+
 // WithBlobTxSidecar returns a copy of tx with the blob sidecar added.
 func (tx *Transaction) WithBlobTxSidecar(sideCar *BlobTxSidecar) *Transaction {
 	blobtx, ok := tx.GetTxInternalData().(*TxInternalDataEthereumBlob)

@@ -893,6 +893,10 @@ func (m *machine) startSpeculativeExecution(proposal bft.Proposal) {
 	blockHash := block.Hash()
 	entry := m.b.specCache.Reserve(blockHash)
 
+	// Adopt pool-known senders; kick async ecrecover for the rest.
+	signer := types.MakeSigner(m.b.chain.Config(), block.Number())
+	blockchain.WarmSenders(signer, block, m.b.chain.TxLookup())
+
 	// Clone executor for isolated execution.
 	executor := m.b.executor.Clone()
 
