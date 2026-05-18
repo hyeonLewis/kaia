@@ -894,8 +894,8 @@ func (m *machine) startSpeculativeExecution(proposal bft.Proposal) {
 	entry := m.b.specCache.Reserve(blockHash)
 
 	// Adopt pool-known senders; kick async ecrecover for the rest.
-	signer := types.MakeSigner(m.b.chain.Config(), block.Number())
-	blockchain.WarmSenders(signer, block, m.b.chain.TxLookup())
+	// signer := types.MakeSigner(m.b.chain.Config(), block.Number())
+	// blockchain.WarmSenders(signer, block, m.b.chain.TxLookup())
 
 	// Clone executor for isolated execution.
 	executor := m.b.executor.Clone()
@@ -908,7 +908,7 @@ func (m *machine) startSpeculativeExecution(proposal bft.Proposal) {
 	}
 
 	// Warm trie-node cache for spec-exec; ctx ties prefetch to this round.
-	blockchain.PrefetchBlockState(ctx, m.b.chain, parentHeader.Root, block.NumberU64(), block.Transactions(), signer)
+	// blockchain.PrefetchBlockState(ctx, m.b.chain, parentHeader.Root, block.NumberU64(), block.Transactions(), signer)
 
 	m.wg.Add(1)
 	go func() {
