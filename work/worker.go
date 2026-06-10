@@ -59,6 +59,9 @@ const (
 	chainSideChanSize = 10
 	// maxResendSize is the size of resending transactions to peer in order to prevent the txs from missing.
 	maxResendTxSize = 1000
+	// maxPoolResetWait bounds how long commitNewWork waits for the txpool to
+	// reset to the parent block before snapshotting pending transactions.
+	maxPoolResetWait = 500 * time.Millisecond
 )
 
 var (
@@ -363,6 +366,24 @@ func (self *worker) waitForIdealBlockTime(parent *types.Block) {
 	}
 }
 
+// waitPoolReset blocks until the txpool has reset to the parent block, so the
+// pending snapshot excludes its mined txs. Normally immediate (the pool resets
+// on ChainPreCommitEvent during the block write); bounded to never stall mining.
+func (self *worker) waitPoolReset(parent *types.Block) {
+	start := time.Now()
+	for self.backend.TxPool().CurrentBlockNumber() < parent.NumberU64() {
+		if time.Since(start) > maxPoolResetWait {
+			logger.Warn("TxPool reset wait timed out, pending snapshot may be stale",
+				"parent", parent.NumberU64(), "poolHead", self.backend.TxPool().CurrentBlockNumber())
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if elapsed := time.Since(start); elapsed > time.Millisecond {
+		logger.Info("Waited for txpool reset", "parent", parent.NumberU64(), "elapsed", elapsed)
+	}
+}
+
 type newWorkTrigger uint8
 
 const (
@@ -385,6 +406,8 @@ func (self *worker) commitNewWork(trigger newWorkTrigger) {
 		self.waitForIdealBlockTime(parent)
 	}
 	tstart := time.Now()
+
+	self.waitPoolReset(parent)
 
 	var pending map[common.Address]types.Transactions
 	var err error
