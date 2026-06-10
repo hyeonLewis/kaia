@@ -251,6 +251,11 @@ type TxPool struct {
 	all     *txLookup                    // All transactions to allow lookups
 	priced  *txPricedList                // All transactions sorted by price
 
+	// Running totals of |pending| and |queue| txs across all senders.
+	// Protected by the same locks as pending/queue.
+	pendingCount uint64
+	queuedCount  uint64
+
 	wg sync.WaitGroup // for shutdown sync
 
 	txMsgCh  chan types.Transactions // A buffer for async tx intake via AddRemotes
@@ -640,6 +645,8 @@ func (pool *TxPool) SetGasPrice(price *big.Int) {
 		pool.gasPrice = price
 		pool.pending = make(map[common.Address]*txList)
 		pool.queue = make(map[common.Address]*txList)
+		pool.pendingCount = 0
+		pool.queuedCount = 0
 		pool.beats = make(map[common.Address]time.Time)
 		pool.all = newTxLookup()
 		pool.pendingNonce = make(map[common.Address]uint64)
@@ -1250,6 +1257,8 @@ func (pool *TxPool) enqueueTx(hash common.Hash, tx *types.Transaction) (bool, er
 		pool.all.Remove(old.Hash())
 		pool.priced.Removed()
 		queuedReplaceCounter.Inc(1)
+	} else {
+		pool.queuedCount++
 	}
 	if pool.all.Get(hash) == nil {
 		pool.all.Add(tx)
@@ -1303,6 +1312,8 @@ func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.T
 		pool.priced.Removed()
 
 		pendingReplaceCounter.Inc(1)
+	} else {
+		pool.pendingCount++
 	}
 	// Failsafe to work around direct pending inserts (tests)
 	if pool.all.Get(hash) == nil {
@@ -1672,11 +1683,13 @@ func (pool *TxPool) removeTx(hash common.Hash, outofbound bool) {
 	// Remove the transaction from the pending lists and reset the account nonce
 	if pending := pool.pending[addr]; pending != nil {
 		if removed, invalids := pending.Remove(tx); removed {
+			// strict-mode Remove also strips invalidated higher-nonce txs from pending.
+			pool.pendingCount -= uint64(1 + len(invalids))
 			// If no more pending transactions are left, remove the list
 			if pending.Empty() {
 				delete(pool.pending, addr)
 			}
-			// Postpone any invalidated transactions
+			// Postpone any invalidated transactions (re-enqueue bumps queuedCount).
 			for _, tx := range invalids {
 				pool.enqueueTx(tx.Hash(), tx)
 			}
@@ -1686,7 +1699,9 @@ func (pool *TxPool) removeTx(hash common.Hash, outofbound bool) {
 	}
 	// Transaction is in the future queue
 	if future := pool.queue[addr]; future != nil {
-		future.Remove(tx)
+		if removed, _ := future.Remove(tx); removed {
+			pool.queuedCount--
+		}
 		if future.Empty() {
 			delete(pool.queue, addr)
 		}
@@ -1717,14 +1732,18 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 			continue // Just in case someone calls with a non existing account
 		}
 		// Drop all transactions that are deemed too old (low nonce)
-		for _, tx := range list.Forward(pool.getNonce(addr)) {
+		forwarded := list.Forward(pool.getNonce(addr))
+		pool.queuedCount -= uint64(len(forwarded))
+		for _, tx := range forwarded {
 			hash := tx.Hash()
 			logger.Trace("Removed old queued transaction", "hash", hash)
 			pool.all.Remove(hash)
 			pool.priced.Removed()
 		}
-		// Drop all transactions that are too costly (low balance)
+		// Drop all transactions that are too costly (low balance). Queue is non-strict
+		// so the second return value is always empty.
 		drops, _ := list.Filter(addr, pool)
+		pool.queuedCount -= uint64(len(drops))
 		for _, tx := range drops {
 			hash := tx.Hash()
 			logger.Trace("Removed unpayable queued transaction", "hash", hash)
@@ -1733,13 +1752,15 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 			queuedNofundsCounter.Inc(1)
 		}
 
-		// Gather all executable transactions and promote them
+		// Gather all executable transactions and promote them. Ready / ReadyWithGasPrice
+		// already removed them from the queue list.
 		var readyTxs types.Transactions
 		if pool.rules.IsMagma {
 			readyTxs = list.ReadyWithGasPrice(pool.getPendingNonce(addr), pool.gasPrice, pool.modules)
 		} else {
 			readyTxs = list.Ready(pool.getPendingNonce(addr))
 		}
+		pool.queuedCount -= uint64(len(readyTxs))
 		for _, tx := range readyTxs {
 			hash := tx.Hash()
 			if pool.promoteTx(addr, hash, tx) {
@@ -1750,7 +1771,9 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 
 		// Drop all transactions over the allowed limit
 		if !pool.locals.contains(addr) {
-			for _, tx := range list.Cap(int(pool.config.NonExecSlotsAccount)) {
+			capped := list.Cap(int(pool.config.NonExecSlotsAccount))
+			pool.queuedCount -= uint64(len(capped))
+			for _, tx := range capped {
 				hash := tx.Hash()
 				pool.all.Remove(hash)
 				pool.priced.Removed()
@@ -1767,11 +1790,9 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 	if len(promoted) > 0 {
 		pool.txFeedCh <- promoted
 	}
-	// If the pending limit is overflown, start equalizing allowances
-	pending := uint64(0)
-	for _, list := range pool.pending {
-		pending += uint64(list.Len())
-	}
+	// If the pending limit is overflown, start equalizing allowances. The running
+	// total is maintained incrementally so this is O(1) instead of O(N_senders).
+	pending := pool.pendingCount
 
 	if pending > pool.config.ExecSlotsAll {
 		pendingBeforeCap := pending
@@ -1799,7 +1820,9 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 				for pending > pool.config.ExecSlotsAll && pool.pending[offenders[len(offenders)-2]].Len() > threshold {
 					for i := 0; i < len(offenders)-1; i++ {
 						list := pool.pending[offenders[i]]
-						for _, tx := range list.Cap(list.Len() - 1) {
+						capped := list.Cap(list.Len() - 1)
+						pool.pendingCount -= uint64(len(capped))
+						for _, tx := range capped {
 							// Drop the transaction from the global pools too
 							hash := tx.Hash()
 							pool.all.Remove(hash)
@@ -1819,7 +1842,9 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 			for pending > pool.config.ExecSlotsAll && uint64(pool.pending[offenders[len(offenders)-1]].Len()) > pool.config.ExecSlotsAccount {
 				for _, addr := range offenders {
 					list := pool.pending[addr]
-					for _, tx := range list.Cap(list.Len() - 1) {
+					capped := list.Cap(list.Len() - 1)
+					pool.pendingCount -= uint64(len(capped))
+					for _, tx := range capped {
 						// Drop the transaction from the global pools too
 						hash := tx.Hash()
 						pool.all.Remove(hash)
@@ -1835,11 +1860,9 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) {
 		}
 		pendingRateLimitCounter.Inc(int64(pendingBeforeCap - pending))
 	}
-	// If we've queued more transactions than the hard limit, drop oldest ones
-	queued := uint64(0)
-	for _, list := range pool.queue {
-		queued += uint64(list.Len())
-	}
+	// If we've queued more transactions than the hard limit, drop oldest ones.
+	// Read the incrementally maintained running total instead of summing every list.
+	queued := pool.queuedCount
 
 	if queued > pool.config.NonExecSlotsAll {
 		// Sort all accounts with queued transactions by heartbeat
@@ -1893,7 +1916,9 @@ func (pool *TxPool) demoteUnexecutables() {
 		var drops, invalids types.Transactions
 
 		// Drop all transactions that are deemed too old (low nonce)
-		for _, tx := range list.Forward(nonce) {
+		forwarded := list.Forward(nonce)
+		pool.pendingCount -= uint64(len(forwarded))
+		for _, tx := range forwarded {
 			hash := tx.Hash()
 			logger.Trace("Removed old pending transaction", "hash", hash)
 			pool.all.Remove(hash)
@@ -1908,6 +1933,9 @@ func (pool *TxPool) demoteUnexecutables() {
 		} else {
 			drops, invalids = list.FilterUnexecutable()
 		}
+		// Filter / FilterUnexecutable strip both drops and invalids from the pending
+		// list. Invalids are re-enqueued to the queue below (queuedCount bumps via enqueueTx).
+		pool.pendingCount -= uint64(len(drops) + len(invalids))
 
 		// Drop all transactions that are unexecutable, and queue any invalids back for later
 		for _, tx := range drops {
@@ -1925,7 +1953,9 @@ func (pool *TxPool) demoteUnexecutables() {
 		}
 		// If there's a gap in front, warn (should never happen) and postpone all transactions
 		if list.Len() > 0 && list.txs.Get(nonce) == nil {
-			for _, tx := range list.Cap(0) {
+			capped := list.Cap(0)
+			pool.pendingCount -= uint64(len(capped))
+			for _, tx := range capped {
 				hash := tx.Hash()
 				logger.Error("Demoting invalidated transaction", "hash", hash)
 				pool.enqueueTx(hash, tx)
@@ -1941,6 +1971,9 @@ func (pool *TxPool) demoteUnexecutables() {
 					logger.Trace("Demoting the tx that is lower than the baseFee and those greater than the nonce of the tx.", "txhash", hash)
 					removed, invalids := list.Remove(tx) // delete all transactions satisfying the nonce value > tx.Nonce()
 					if removed {
+						// Both `tx` and `invalids` were stripped from pending; the re-enqueue
+						// below bumps queuedCount per tx via enqueueTx.
+						pool.pendingCount -= uint64(1 + len(invalids))
 						for _, invalidTx := range invalids {
 							pool.enqueueTx(invalidTx.Hash(), invalidTx)
 						}
@@ -2298,5 +2331,7 @@ func (pool *TxPool) Clear() {
 	pool.priced = newTxPricedList(pool.all)
 	pool.pending = make(map[common.Address]*txList)
 	pool.queue = make(map[common.Address]*txList)
+	pool.pendingCount = 0
+	pool.queuedCount = 0
 	pool.pendingNonce = make(map[common.Address]uint64)
 }
